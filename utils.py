@@ -2,6 +2,10 @@ import numpy as np
 import torch
 import os
 import random
+import cv2
+from PIL import Image
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Dataset
 
 
 def remove_specular_component(image, K=0.4, epsilon=1e-8):
@@ -109,3 +113,88 @@ def get_random_image_paths(directory, num_images=8):
         return random.sample(all_files, num_images)
     else:
         return all_files
+
+
+# Use ColorCarsDataset for preprocessing to the model
+class ColorCarsDataset(Dataset):
+    def __init__(self, image_paths, transform=None):
+        self.image_paths = image_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image_path = self.image_paths[idx]
+        image = Image.open(image_path).convert('RGB')
+        image = np.array(image)
+
+        # Preprocess functions
+        image_r = remove_specular_component(image)
+        binary_image = apply_threshold_segmentation(image_r)
+        most_informative_row = find_most_informative_region(binary_image)
+        valid_image = cv2.bitwise_and(image, image, mask=binary_image)
+        final_image = extract_roi(valid_image, most_informative_row, height=70)
+
+        # Move to PIL data
+        final_image_pil = Image.fromarray(final_image.astype('uint8'), 'RGB')
+
+        # Apply transformations
+        if self.transform:
+            final_image_transformed = self.transform(final_image_pil)
+        else:
+            final_image_transformed = transforms.ToTensor()(final_image_pil)
+
+        return final_image_transformed
+
+
+def make_inference_torch(image_paths, model, gmm, scaler):
+    """
+    Perform inference on a set of images using a pre-trained model and Gaussian Mixture Model (GMM).
+    """
+    # Necessary transform to input the images to the model
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    dataset = ColorCarsDataset(image_paths, transform=transform)
+    data_loader = DataLoader(dataset, batch_size=64, shuffle=False)
+    features = extract_features(model, data_loader)
+    normalized_features = scaler.transform(features)
+    labels = gmm.predict(normalized_features)
+
+    return labels
+
+
+def make_inference_onnx(image_paths, ort_session, gmm, scaler):
+    """
+    Perform inference on a set of images using a pre-trained onnx model and Gaussian Mixture Model (GMM).
+    """
+    # Necessary transform to input the images to the model
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Similar setup as before
+    dataset = ColorCarsDataset(image_paths, transform=transform)
+    data_loader = DataLoader(dataset, batch_size=64, shuffle=False)
+
+    # Modificar la extracción de características para usar ONNX Runtime
+    all_features = []
+    for batch in data_loader:
+        # ONNX Runtime espera numpy arrays
+        batch_np = batch.numpy()
+        ort_inputs = {ort_session.get_inputs()[0].name: batch_np}
+        ort_outs = ort_session.run(None, ort_inputs)
+        pooled_outputs = np.mean(ort_outs[0], axis=(2, 3))
+        all_features.append(pooled_outputs)
+
+    # Resto del código similar
+    features = np.concatenate(all_features, axis=0)
+    normalized_features = scaler.transform(features)
+    labels = gmm.predict(normalized_features)
+    return labels
